@@ -47,6 +47,7 @@ async def list_runs(
     """
     Returns all runs visible to user sorted by descending `submitted_at`.
     `project_name`, `repo_id`, `username`, and `only_active` can be specified as filters.
+    Setting `only_active` to `true`, excludes finished runs and deleted runs.
     Specifying `repo_id` without `project_name` returns no runs.
 
     The results are paginated. To get the next page, pass `submitted_at` and `id` of

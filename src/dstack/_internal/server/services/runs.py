@@ -163,7 +163,8 @@ async def list_projects_run_models(
     limit: int,
     ascending: bool,
 ) -> List[RunModel]:
-    filters = [RunModel.deleted == False, RunModel.project_id.in_(p.id for p in projects)]
+    filters = []
+    filters.append(RunModel.project_id.in_(p.id for p in projects))
     if repo is not None:
         filters.append(RunModel.repo_id == repo.id)
     if runs_user is not None:
