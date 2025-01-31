@@ -98,6 +98,7 @@ class ServerProxyRepo(BaseProxyRepo):
             https=None,
             auth=run_spec.configuration.auth,
             client_max_body_size=DEFAULT_SERVICE_CLIENT_MAX_BODY_SIZE,
+            strip_prefix=run_spec.configuration.strip_prefix,
             replicas=tuple(replicas),
         )
 

@@ -29,6 +29,7 @@ def make_service(
     domain: Optional[str] = None,
     https: Optional[bool] = None,
     auth: bool = False,
+    strip_prefix: bool = True,
 ) -> Service:
     return Service(
         project_name=project_name,
@@ -37,6 +38,7 @@ def make_service(
         https=https,
         auth=auth,
         client_max_body_size=2**20,
+        strip_prefix=strip_prefix,
         replicas=(
             Replica(
                 id="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",

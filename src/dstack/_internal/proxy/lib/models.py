@@ -32,6 +32,7 @@ class Service(ImmutableModel):
     https: Optional[bool]  # only used on gateways
     auth: bool
     client_max_body_size: int  # only enforced on gateways
+    strip_prefix: bool = True  # only used in-server
     replicas: tuple[Replica, ...]
 
     @property

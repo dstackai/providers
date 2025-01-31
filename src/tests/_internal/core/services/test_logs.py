@@ -1,3 +1,5 @@
+import pytest
+
 from dstack._internal.core.models.runs import AppSpec
 from dstack._internal.core.services.logs import URLReplacer
 
@@ -126,7 +128,18 @@ class TestServiceURLReplacer:
         )
         assert replacer(b"http://0.0.0.0:8000/qwerty") == b"https://secure.host.com/qwerty"
 
-    def test_in_server_proxy(self):
+    @pytest.mark.parametrize(
+        ("in_path", "out_path"),
+        [
+            ("", "/proxy/services/main/service/"),
+            ("/", "/proxy/services/main/service/"),
+            ("/a/b/c", "/proxy/services/main/service/a/b/c"),
+            ("/proxy/services/main/service", "/proxy/services/main/service"),
+            ("/proxy/services/main/service/", "/proxy/services/main/service/"),
+            ("/proxy/services/main/service/a/b/c", "/proxy/services/main/service/a/b/c"),
+        ],
+    )
+    def test_adds_prefix_unless_already_present(self, in_path: str, out_path: str) -> None:
         replacer = URLReplacer(
             ports={8888: 3000},
             app_specs=[],
@@ -135,9 +148,6 @@ class TestServiceURLReplacer:
             path_prefix="/proxy/services/main/service/",
         )
         assert (
-            replacer(b"http://0.0.0.0:8888") == b"http://0.0.0.0:3000/proxy/services/main/service/"
-        )
-        assert (
-            replacer(b"http://0.0.0.0:8888/qwerty")
-            == b"http://0.0.0.0:3000/proxy/services/main/service/qwerty"
+            replacer(f"http://0.0.0.0:8888{in_path}".encode())
+            == f"http://0.0.0.0:3000{out_path}".encode()
         )

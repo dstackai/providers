@@ -967,7 +967,7 @@ def _validate_run_spec_and_set_defaults(run_spec: RunSpec):
 _UPDATABLE_SPEC_FIELDS = ["repo_code_hash", "configuration"]
 # Most service fields can be updated via replica redeployment.
 # TODO: Allow updating other fields when a rolling deployment is supported.
-_UPDATABLE_CONFIGURATION_FIELDS = ["replicas", "scaling"]
+_UPDATABLE_CONFIGURATION_FIELDS = ["replicas", "scaling", "strip_prefix"]
 
 
 def _can_update_run_spec(current_run_spec: RunSpec, new_run_spec: RunSpec) -> bool:

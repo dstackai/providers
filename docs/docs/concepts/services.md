@@ -112,6 +112,48 @@ port: 8000
 
 </div>
 
+### Path prefix { #path-prefix }
+
+If your `dstack` project doesn't have a [gateway](gateways.md), services are hosted with the
+`/proxy/services/<project name>/<run name>/` path prefix in the URL.
+When running web apps, you may need to set some app-specific settings
+so that browser-side scripts and CSS work correctly with the path prefix.
+
+<div editor-title="dash.dstack.yml"> 
+
+```yaml
+type: service
+name: dash
+gateway: false
+
+# Disable authorization
+auth: false
+# Do not strip the path prefix
+strip_prefix: false
+
+env:
+  # Configure Dash to work with a path prefix
+  # Replace `main` with your dstack project name
+  - DASH_ROUTES_PATHNAME_PREFIX=/proxy/services/main/dash/
+
+commands:
+  - pip install dash
+  # Assuming the Dash app is in your repo at app.py
+  - python app.py
+
+port: 8050
+```
+
+</div>
+
+By default, `dstack` strips the prefix before forwarding requests to your service,
+so to the service it appears as if the prefix isn't there. This allows some apps
+to work out of the box. If your app doesn't expect the prefix to be stripped,
+set [`strip_prefix`](../reference/dstack.yml/service.md#strip_prefix) to `false`.
+
+If your app cannot be configured to work with a path prefix, you can host it
+on a dedicated domain name by setting up a [gateway](gateways.md).
+
 ### Model
 
 If the service is running a chat model with an OpenAI-compatible interface,
@@ -345,9 +387,9 @@ via the [`spot_policy`](../reference/dstack.yml/service.md#spot_policy) property
 Running services doesn't require [gateways](gateways.md) unless you need to enable auto-scaling or want the endpoint to
 use HTTPS and map it to your domain.
 
-!!! info "Websockets and base path"
-    A [gateway](gateways.md) may also be required if the service needs Websockets or cannot be used with 
-    a base path.
+!!! info "Websockets and path prefix"
+    A gateway may also be required if the service needs Websockets or cannot be used with 
+    a [path prefix](#path-prefix).
 
 > If you're using [dstack Sky :material-arrow-top-right-thin:{ .external }](https://sky.dstack.ai){:target="_blank"},
 > a gateway is already pre-configured for you.

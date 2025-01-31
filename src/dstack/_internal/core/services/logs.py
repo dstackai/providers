@@ -42,11 +42,14 @@ class URLReplacer:
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
         if app_spec and app_spec.url_query_params is not None:
             qs.update({k.encode(): v.encode() for k, v in app_spec.url_query_params.items()})
+        path = url.path
+        if not path.startswith(self.path_prefix.removesuffix(b"/")):
+            path = concat_url_path(self.path_prefix, path)
 
         url = url._replace(
             scheme=("https" if self.secure else "http").encode(),
             netloc=(self.hostname if omit_port else f"{self.hostname}:{local_port}").encode(),
-            path=concat_url_path(self.path_prefix, url.path),
+            path=path,
             query=urllib.parse.urlencode(qs).encode(),
         )
         return url.geturl()

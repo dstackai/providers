@@ -12,6 +12,7 @@ from dstack._internal.proxy.lib.services.service_connection import (
     ServiceConnectionPool,
     get_service_replica_client,
 )
+from dstack._internal.utils.common import concat_url_path
 from dstack._internal.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -36,6 +37,9 @@ async def proxy(
         await auth.enforce()
 
     client = await get_service_replica_client(service, repo, service_conn_pool)
+
+    if not service.strip_prefix:
+        path = concat_url_path(request.scope.get("root_path", "/"), request.url.path)
 
     try:
         upstream_request = await build_upstream_request(request, path, client)

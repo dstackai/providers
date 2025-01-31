@@ -21,6 +21,7 @@ from dstack._internal.core.models.volumes import MountPoint, VolumeConfiguration
 CommandsList = List[str]
 ValidPort = conint(gt=0, le=65536)
 SERVICE_HTTPS_DEFAULT = True
+STRIP_PREFIX_DEFAULT = True
 
 
 class RunConfigurationType(str, Enum):
@@ -236,6 +237,16 @@ class ServiceConfigurationParams(CoreModel):
             ),
         ),
     ] = None
+    strip_prefix: Annotated[
+        bool,
+        Field(
+            description=(
+                "Strip the `/proxy/services/<project name>/<run name>/` path prefix"
+                " when forwarding requests to the service. Only takes effect"
+                " when running the service without a gateway"
+            )
+        ),
+    ] = STRIP_PREFIX_DEFAULT
     model: Annotated[
         Optional[Union[AnyModel, str]],
         Field(
