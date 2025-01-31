@@ -81,7 +81,7 @@ async def _process_next_running_job():
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
-            job_model = res.scalar()
+            job_model = res.unique().scalar()
             if job_model is None:
                 return
             lockset.add(job_model.id)
@@ -102,7 +102,7 @@ async def _process_running_job(session: AsyncSession, job_model: JobModel):
         .options(joinedload(JobModel.instance))
         .execution_options(populate_existing=True)
     )
-    job_model = res.scalar_one()
+    job_model = res.unique().scalar_one()
     res = await session.execute(
         select(RunModel)
         .where(RunModel.id == job_model.run_id)

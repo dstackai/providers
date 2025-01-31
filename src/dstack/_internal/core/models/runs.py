@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type, Union
 
 from pydantic import UUID4, Field, root_validator
 from typing_extensions import Annotated
@@ -13,6 +13,7 @@ from dstack._internal.core.models.configurations import (
 )
 from dstack._internal.core.models.instances import (
     InstanceOfferWithAvailability,
+    InstanceSharedOffer,
     InstanceType,
     SSHConnectionParams,
 )
@@ -239,6 +240,10 @@ class JobRuntimeData(CoreModel):
     # None if data is not yet available (on vm-based backends and ssh instances)
     # or not applicable (container-based backends)
     ports: Optional[dict[int, int]] = None
+    # List of volumes used by the job
+    volume_names: Optional[list[str]] = None  # None for backward compalibility
+    # Virtual shared offer. None if the instance is not shared.
+    offer: Optional[InstanceSharedOffer] = None
 
 
 class ClusterInfo(CoreModel):
@@ -416,7 +421,7 @@ class Run(CoreModel):
 
 class JobPlan(CoreModel):
     job_spec: JobSpec
-    offers: List[InstanceOfferWithAvailability]
+    offers: List[Union[InstanceSharedOffer, InstanceOfferWithAvailability]]
     total_offers: int
     max_price: Optional[float]
 

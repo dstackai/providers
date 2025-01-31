@@ -52,7 +52,7 @@ async def _process_next_terminating_job():
                         InstanceModel.id == job_model.used_instance_id,
                         InstanceModel.id.not_in(instance_lockset),
                     )
-                    .options(lazyload(InstanceModel.job))
+                    .options(lazyload(InstanceModel.jobs))
                     .with_for_update(skip_locked=True)
                 )
                 instance_model = res.scalar()

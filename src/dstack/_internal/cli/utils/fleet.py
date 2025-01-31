@@ -41,6 +41,12 @@ def get_fleets_table(
                 resources = instance.instance_type.resources.pretty_format(include_spot=True)
 
             status = instance.status.value
+            total_blocks = instance.total_blocks
+            busy_blocks = instance.busy_blocks
+            if total_blocks is not None and busy_blocks is not None:
+                if busy_blocks < total_blocks and instance.status == InstanceStatus.BUSY:
+                    idle_blocks = total_blocks - busy_blocks
+                    status = f"{idle_blocks}/{total_blocks} {InstanceStatus.IDLE.value}"
             if (
                 instance.status in [InstanceStatus.IDLE, InstanceStatus.BUSY]
                 and instance.unreachable

@@ -2,7 +2,7 @@ import ipaddress
 import uuid
 from collections.abc import Container, Iterable
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Literal, Optional, Union
 
 import gpuhunt
 from sqlalchemy import and_, or_, select
@@ -26,6 +26,8 @@ from dstack._internal.core.models.instances import (
     InstanceConfiguration,
     InstanceOffer,
     InstanceOfferWithAvailability,
+    InstanceSharedInfo,
+    InstanceSharedOffer,
     InstanceStatus,
     InstanceType,
     RemoteConnectionInfo,
@@ -51,6 +53,7 @@ from dstack._internal.server.models import (
     UserModel,
 )
 from dstack._internal.server.services.locking import get_locker
+from dstack._internal.server.services.offers import generate_shared_offer
 from dstack._internal.server.services.projects import list_project_models, list_user_project_models
 from dstack._internal.utils import common as common_utils
 from dstack._internal.utils import random_names
@@ -206,7 +209,7 @@ async def remove_instance(
     terminated = False
     for instance in pool.instances:
         if instance.name == instance_name:
-            if force or instance.job_id is None:
+            if force or not instance.jobs:
                 instance.status = InstanceStatus.TERMINATING
                 terminated = True
     await session.commit()
@@ -262,8 +265,10 @@ def instance_model_to_instance(instance_model: InstanceModel) -> Instance:
         instance.instance_type = jpd.instance_type
         instance.hostname = jpd.hostname
 
-    if instance_model.job is not None:
-        instance.job_name = instance_model.job.job_name
+    shared_info = get_instance_shared_info(instance_model)
+    if shared_info is not None and isinstance(shared_info.total_blocks, int):
+        instance.total_blocks = shared_info.total_blocks
+        instance.busy_blocks = shared_info.busy_blocks
 
     return instance
 
@@ -290,6 +295,12 @@ def get_instance_profile(instance_model: InstanceModel) -> Profile:
 
 def get_instance_requirements(instance_model: InstanceModel) -> Requirements:
     return Requirements.__response__.parse_raw(instance_model.requirements)
+
+
+def get_instance_shared_info(instance_model: InstanceModel) -> Optional[InstanceSharedInfo]:
+    if instance_model.shared_info is None:
+        return None
+    return InstanceSharedInfo.__response__.parse_raw(instance_model.shared_info)
 
 
 async def generate_instance_name(
@@ -409,13 +420,14 @@ async def add_remote(
 def filter_pool_instances(
     pool_instances: List[InstanceModel],
     profile: Profile,
-    requirements: Requirements,
     *,
+    requirements: Optional[Requirements] = None,
     status: Optional[InstanceStatus] = None,
     fleet_model: Optional[FleetModel] = None,
     multinode: bool = False,
     master_job_provisioning_data: Optional[JobProvisioningData] = None,
     volumes: Optional[List[List[Volume]]] = None,
+    shared: bool = False,
 ) -> List[InstanceModel]:
     instances: List[InstanceModel] = []
     candidates: List[InstanceModel] = []
@@ -480,8 +492,13 @@ def filter_pool_instances(
             and jpd.availability_zone not in zones
         ):
             continue
+        if (instance.shared_info is not None) != shared:
+            continue
 
         candidates.append(instance)
+
+    if requirements is None:
+        return candidates
 
     query_filter = requirements_to_query_filter(requirements)
     for instance in candidates:
@@ -492,6 +509,53 @@ def filter_pool_instances(
         if gpuhunt.matches(catalog_item, query_filter):
             instances.append(instance)
     return instances
+
+
+def get_shared_pool_instances_with_offers(
+    pool_instances: List[InstanceModel],
+    profile: Profile,
+    requirements: Requirements,
+    *,
+    idle_only: bool = False,
+    fleet_model: Optional[FleetModel] = None,
+    volumes: Optional[List[List[Volume]]] = None,
+) -> list[tuple[InstanceModel, InstanceSharedOffer]]:
+    instances_with_offers: list[tuple[InstanceModel, InstanceSharedOffer]] = []
+    query_filter = requirements_to_query_filter(requirements)
+    filtered_instances = filter_pool_instances(
+        pool_instances=pool_instances,
+        profile=profile,
+        fleet_model=fleet_model,
+        multinode=False,
+        volumes=volumes,
+        shared=True,
+    )
+    for instance in filtered_instances:
+        if idle_only and instance.status not in [InstanceStatus.IDLE, InstanceStatus.BUSY]:
+            continue
+        offer = get_instance_offer(instance)
+        if offer is None:
+            continue
+        shared_info = get_instance_shared_info(instance)
+        if shared_info is None:
+            continue
+        total_blocks = shared_info.total_blocks
+        if total_blocks == "auto":
+            # provisioning in progress
+            continue
+        idle_blocks = total_blocks - shared_info.busy_blocks
+        for blocks in range(1, total_blocks + 1):
+            shared_offer = generate_shared_offer(offer, blocks, total_blocks)
+            catalog_item = offer_to_catalog_item(shared_offer)
+            if gpuhunt.matches(catalog_item, query_filter):
+                if blocks <= idle_blocks:
+                    shared_offer.availability = InstanceAvailability.IDLE
+                else:
+                    shared_offer.availability = InstanceAvailability.BUSY
+                if shared_offer.availability == InstanceAvailability.IDLE or not idle_only:
+                    instances_with_offers.append((instance, shared_offer))
+                break
+    return instances_with_offers
 
 
 async def list_pools_instance_models(
@@ -557,7 +621,7 @@ async def list_pools_instance_models(
         .limit(limit)
         .options(joinedload(InstanceModel.pool), joinedload(InstanceModel.fleet))
     )
-    instance_models = list(res.scalars().all())
+    instance_models = list(res.unique().scalars().all())
     return instance_models
 
 
@@ -618,7 +682,7 @@ async def list_active_remote_instances(
     res = await session.execute(
         select(InstanceModel).where(*filters).order_by(InstanceModel.created_at.asc())
     )
-    instance_models = list(res.scalars().all())
+    instance_models = list(res.unique().scalars().all())
     return instance_models
 
 
@@ -633,6 +697,7 @@ async def create_instance_model(
     instance_num: int,
     placement_group_name: Optional[str],
     reservation: Optional[str],
+    blocks: Optional[Union[Literal["auto"], int]] = None,
 ) -> InstanceModel:
     termination_policy, termination_idle_time = get_termination(
         profile, DEFAULT_POOL_TERMINATION_IDLE_TIME
@@ -651,6 +716,10 @@ async def create_instance_model(
         placement_group_name=placement_group_name,
         reservation=reservation,
     )
+    if blocks is not None:
+        shared_info = InstanceSharedInfo(total_blocks=blocks)
+    else:
+        shared_info = None
     instance = InstanceModel(
         id=instance_id,
         name=instance_name,
@@ -665,6 +734,7 @@ async def create_instance_model(
         instance_configuration=instance_config.json(),
         termination_policy=termination_policy,
         termination_idle_time=termination_idle_time,
+        shared_info=shared_info.json() if shared_info is not None else None,
     )
     session.add(instance)
     return instance
@@ -683,6 +753,7 @@ async def create_ssh_instance_model(
     ssh_user: str,
     ssh_keys: List[SSHKey],
     env: Env,
+    blocks: Optional[Union[Literal["auto"], int]] = None,
 ) -> InstanceModel:
     # TODO: doc - will overwrite after remote connected
     instance_resource = Resources(cpus=2, memory_mib=8, gpus=[], spot=False)
@@ -719,6 +790,10 @@ async def create_ssh_instance_model(
         ssh_keys=ssh_keys,
         env=env,
     )
+    if blocks is not None:
+        shared_info = InstanceSharedInfo(total_blocks=blocks)
+    else:
+        shared_info = None
     im = InstanceModel(
         id=uuid.uuid4(),
         name=instance_name,
@@ -737,5 +812,6 @@ async def create_ssh_instance_model(
         price=offer.price,
         termination_policy=TerminationPolicy.DONT_DESTROY,
         termination_idle_time=0,
+        shared_info=shared_info.json() if shared_info is not None else None,
     )
     return im

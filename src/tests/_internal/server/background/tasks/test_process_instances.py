@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from typing import Optional
 from unittest.mock import Mock, patch
 
+import gpuhunt
 import pytest
 from freezegun import freeze_time
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,8 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from dstack._internal.core.errors import BackendError
 from dstack._internal.core.models.backends.base import BackendType
 from dstack._internal.core.models.instances import (
+    Gpu,
     InstanceAvailability,
     InstanceOfferWithAvailability,
+    InstanceSharedInfo,
     InstanceStatus,
     InstanceType,
     Resources,
@@ -33,6 +36,7 @@ from dstack._internal.server.testing.common import (
     create_repo,
     create_run,
     create_user,
+    get_remote_connection_info,
 )
 from dstack._internal.utils.common import get_current_datetime
 
@@ -118,11 +122,6 @@ class TestCheckShim:
             repo=repo,
             user=user,
         )
-        job = await create_job(
-            session=session,
-            run=run,
-            status=JobStatus.SUBMITTED,
-        )
 
         instance = await create_instance(
             session, project, pool, status=InstanceStatus.PROVISIONING
@@ -131,7 +130,13 @@ class TestCheckShim:
             tzinfo=dt.timezone.utc
         ) + dt.timedelta(days=1)
         instance.health_status = "ssh connect problem"
-        instance.job = job
+
+        job = await create_job(
+            session=session,
+            run=run,
+            status=JobStatus.SUBMITTED,
+            instance=instance,
+        )
 
         await session.commit()
 
@@ -142,12 +147,13 @@ class TestCheckShim:
             await process_instances()
 
         await session.refresh(instance)
+        await session.refresh(job)
 
         assert instance is not None
         assert instance.status == InstanceStatus.BUSY
         assert instance.termination_deadline is None
         assert instance.health_status is None
-        assert instance.job == job
+        assert job.instance == instance
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
@@ -310,7 +316,7 @@ class TestTerminateIdleTime:
         assert instance.termination_reason == "Idle timeout"
 
 
-class TestOnPremInstanceTerminateProvisionTimeoutExpired:
+class TestSSHInstanceTerminateProvisionTimeoutExpired:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
     async def test_terminate_by_idle_timeout(self, test_db, session: AsyncSession):
@@ -469,10 +475,11 @@ class TestTerminate:
         assert instance.status == InstanceStatus.TERMINATED
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+@pytest.mark.usefixtures("test_db")
 class TestCreateInstance:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
-    async def test_creates_instance(self, test_db, session: AsyncSession):
+    async def test_creates_instance_no_blocks(self, session: AsyncSession):
         project = await create_project(session=session)
         pool = await create_pool(session, project)
         instance = await create_instance(session, project, pool, status=InstanceStatus.PENDING)
@@ -512,3 +519,192 @@ class TestCreateInstance:
 
         await session.refresh(instance)
         assert instance.status == InstanceStatus.PROVISIONING
+        assert instance.shared_info is None
+
+    @pytest.mark.parametrize(
+        ["blocks", "expected_blocks"],
+        [
+            [4, 4],
+            ["auto", 8],
+        ],
+    )
+    async def test_creates_instance_with_blocks(
+        self, session: AsyncSession, blocks, expected_blocks
+    ):
+        project = await create_project(session=session)
+        pool = await create_pool(session, project)
+        shared_info = InstanceSharedInfo(total_blocks=blocks)
+        instance = await create_instance(
+            session, project, pool, status=InstanceStatus.PENDING, shared_info=shared_info
+        )
+        with patch(
+            "dstack._internal.server.background.tasks.process_instances.get_create_instance_offers"
+        ) as get_create_instance_offers:
+            gpu = Gpu(name="T4", memory_mib=16384, vendor=gpuhunt.AcceleratorVendor.NVIDIA)
+            offer = InstanceOfferWithAvailability(
+                backend=BackendType.AWS,
+                instance=InstanceType(
+                    name="instance",
+                    resources=Resources(cpus=32, memory_mib=131072, spot=False, gpus=[gpu] * 8),
+                ),
+                region="us",
+                price=1.0,
+                availability=InstanceAvailability.AVAILABLE,
+            )
+
+            backend_mock = Mock()
+            backend_mock.TYPE = BackendType.AWS
+            backend_mock.compute.return_value.get_offers_cached.return_value = [offer]
+            backend_mock.compute.return_value.create_instance.return_value = JobProvisioningData(
+                backend=offer.backend,
+                instance_type=offer.instance,
+                instance_id="instance_id",
+                hostname="1.1.1.1",
+                internal_ip=None,
+                region=offer.region,
+                price=offer.price,
+                username="ubuntu",
+                ssh_port=22,
+                ssh_proxy=None,
+                dockerized=True,
+                backend_data=None,
+            )
+            get_create_instance_offers.return_value = [(backend_mock, offer)]
+            await process_instances()
+
+        await session.refresh(instance)
+        assert instance.status == InstanceStatus.PROVISIONING
+        assert InstanceSharedInfo.parse_raw(instance.shared_info) == InstanceSharedInfo(
+            total_blocks=expected_blocks, busy_blocks=0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_db", ["sqlite", "postgres"], indirect=True)
+@pytest.mark.usefixtures("test_db", "deploy_instance_mock")
+class TestAddSSHInstance:
+    @pytest.fixture
+    def host_info(self) -> dict:
+        return {
+            "gpu_vendor": "nvidia",
+            "gpu_name": "T4",
+            "gpu_memory": 16384,
+            "gpu_count": 1,
+            "addresses": ["192.168.100.100/24"],
+            "disk_size": 260976517120,
+            "cpus": 32,
+            "memory": 33544130560,
+        }
+
+    @pytest.fixture
+    def deploy_instance_mock(self, monkeypatch: pytest.MonkeyPatch, host_info: dict):
+        mock = Mock(return_value=(HealthStatus(healthy=True, reason="OK"), host_info))
+        monkeypatch.setattr(
+            "dstack._internal.server.background.tasks.process_instances._deploy_instance", mock
+        )
+        return mock
+
+    async def test_adds_ssh_instance_no_blocks_requested(
+        self, session: AsyncSession, host_info: dict
+    ):
+        host_info["gpu_count"] = 8
+        project = await create_project(session=session)
+        pool = await create_pool(session, project)
+        instance = await create_instance(
+            session,
+            project,
+            pool,
+            status=InstanceStatus.PENDING,
+            created_at=get_current_datetime(),
+            remote_connection_info=get_remote_connection_info(),
+            shared_info=None,
+        )
+        await session.commit()
+
+        await process_instances()
+
+        await session.refresh(instance)
+        assert instance.status == InstanceStatus.IDLE
+        assert instance.shared_info is None
+
+    @pytest.mark.parametrize(
+        ["gpu_count", "total_blocks"],
+        [
+            [0, "auto"],
+            [1, "auto"],
+            [1, 1],
+        ],
+    )
+    async def test_adds_ssh_instance_no_blocks_zero_or_one_gpu(
+        self, session: AsyncSession, host_info: dict, gpu_count, total_blocks
+    ):
+        host_info["gpu_count"] = gpu_count
+        project = await create_project(session=session)
+        pool = await create_pool(session, project)
+        if total_blocks is None:
+            shared_info = None
+        else:
+            shared_info = InstanceSharedInfo(total_blocks=total_blocks)
+        instance = await create_instance(
+            session,
+            project,
+            pool,
+            status=InstanceStatus.PENDING,
+            created_at=get_current_datetime(),
+            remote_connection_info=get_remote_connection_info(),
+            shared_info=shared_info,
+        )
+        await session.commit()
+
+        await process_instances()
+
+        await session.refresh(instance)
+        assert instance.status == InstanceStatus.IDLE
+        assert instance.shared_info is None
+
+    async def test_adds_ssh_instance_number_blocks(self, session: AsyncSession, host_info: dict):
+        host_info["gpu_count"] = 8
+        project = await create_project(session=session)
+        pool = await create_pool(session, project)
+        instance = await create_instance(
+            session,
+            project,
+            pool,
+            status=InstanceStatus.PENDING,
+            created_at=get_current_datetime(),
+            remote_connection_info=get_remote_connection_info(),
+            shared_info=InstanceSharedInfo(total_blocks=4),
+        )
+        await session.commit()
+
+        await process_instances()
+
+        await session.refresh(instance)
+        assert instance.status == InstanceStatus.IDLE
+        assert InstanceSharedInfo.parse_raw(instance.shared_info) == InstanceSharedInfo(
+            total_blocks=4, busy_blocks=0
+        )
+
+    @pytest.mark.usefixtures("deploy_instance_mock")
+    async def test_adds_ssh_instance_auto_blocks(self, session: AsyncSession, host_info: dict):
+        host_info["gpu_count"] = 8
+        project = await create_project(session=session)
+        pool = await create_pool(session, project)
+        instance = await create_instance(
+            session,
+            project,
+            pool,
+            status=InstanceStatus.PENDING,
+            created_at=get_current_datetime(),
+            remote_connection_info=get_remote_connection_info(),
+            shared_info=InstanceSharedInfo(total_blocks="auto"),
+        )
+        await session.commit()
+
+        await process_instances()
+
+        await session.refresh(instance)
+        assert instance.status == InstanceStatus.IDLE
+        assert InstanceSharedInfo.parse_raw(instance.shared_info) == InstanceSharedInfo(
+            total_blocks=8, busy_blocks=0
+        )

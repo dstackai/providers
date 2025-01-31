@@ -86,6 +86,7 @@ from dstack._internal.server.services.pools import (
     get_instance_profile,
     get_instance_provisioning_data,
     get_instance_requirements,
+    get_instance_shared_info,
 )
 from dstack._internal.server.services.runner import client as runner_client
 from dstack._internal.server.services.runner.client import HealthStatus
@@ -133,7 +134,7 @@ async def _process_next_instance():
                     ),
                     InstanceModel.id.not_in(lockset),
                 )
-                .options(lazyload(InstanceModel.job))
+                .options(lazyload(InstanceModel.jobs))
                 .order_by(InstanceModel.last_processed_at.asc())
                 .limit(1)
                 .with_for_update(skip_locked=True)
@@ -156,7 +157,7 @@ async def _process_instance(session: AsyncSession, instance: InstanceModel):
         select(InstanceModel)
         .where(InstanceModel.id == instance.id)
         .options(joinedload(InstanceModel.project).joinedload(ProjectModel.backends))
-        .options(joinedload(InstanceModel.job))
+        .options(joinedload(InstanceModel.jobs))
         .options(joinedload(InstanceModel.fleet).joinedload(FleetModel.instances))
         .execution_options(populate_existing=True)
     )
@@ -164,7 +165,7 @@ async def _process_instance(session: AsyncSession, instance: InstanceModel):
     if (
         instance.status == InstanceStatus.IDLE
         and instance.termination_policy == TerminationPolicy.DESTROY_AFTER_IDLE
-        and instance.job_id is None
+        and not instance.jobs
     ):
         await _mark_terminating_if_idle_duration_expired(instance)
     if instance.status == InstanceStatus.PENDING:
@@ -322,6 +323,30 @@ async def _add_remote(instance: InstanceModel) -> None:
             )
             return
 
+    shared_info = get_instance_shared_info(instance)
+    if shared_info is not None:
+        resources = instance_type.resources
+        blocks = shared_info.total_blocks
+        if blocks == "auto":
+            blocks = len(resources.gpus)
+        if blocks > 1:
+            if len(resources.gpus) % blocks or resources.cpus % blocks:
+                instance.status = InstanceStatus.TERMINATED
+                instance.termination_reason = "Cannot split into blocks"
+                logger.warning(
+                    "Failed to add instance %s: cannot split into blocks",
+                    instance.name,
+                    extra={
+                        "instance_name": instance.name,
+                        "instance_status": InstanceStatus.TERMINATED.value,
+                    },
+                )
+                return
+            shared_info.total_blocks = blocks
+            instance.shared_info = shared_info.json()
+        else:
+            instance.shared_info = None
+
     region = instance.region
     jpd = JobProvisioningData(
         backend=BackendType.REMOTE,
@@ -439,10 +464,11 @@ async def _create_instance(session: AsyncSession, instance: InstanceModel) -> No
         instance_configuration = get_instance_configuration(instance)
         profile = get_instance_profile(instance)
         requirements = get_instance_requirements(instance)
+        shared_info = get_instance_shared_info(instance)
     except ValidationError as e:
         instance.status = InstanceStatus.TERMINATED
         instance.termination_reason = (
-            f"Error to parse profile, requirements or instance_configuration: {e}"
+            f"Error to parse profile, requirements, shared_info or instance_configuration: {e}"
         )
         instance.last_retry_at = get_current_datetime()
         logger.warning(
@@ -473,12 +499,18 @@ async def _create_instance(session: AsyncSession, instance: InstanceModel) -> No
             )
             return
 
+    if shared_info is None:
+        blocks = None
+    else:
+        blocks = shared_info.total_blocks
+
     offers = await get_create_instance_offers(
         project=instance.project,
         profile=profile,
         requirements=requirements,
         exclude_not_available=True,
         fleet_model=instance.fleet,
+        blocks=blocks,
     )
 
     if not offers and should_retry:
@@ -557,6 +589,18 @@ async def _create_instance(session: AsyncSession, instance: InstanceModel) -> No
         instance.started_at = get_current_datetime()
         instance.last_retry_at = get_current_datetime()
 
+        if shared_info is not None:
+            if blocks == "auto":
+                blocks = len(instance_offer.instance.resources.gpus)
+                if blocks > 1:
+                    shared_info.total_blocks = blocks
+                else:
+                    shared_info = None
+            if shared_info is not None:
+                instance.shared_info = shared_info.json()
+            else:
+                instance.shared_info = None
+
         logger.info(
             "Created instance %s",
             instance.name,
@@ -585,8 +629,8 @@ async def _create_instance(session: AsyncSession, instance: InstanceModel) -> No
 async def _check_instance(instance: InstanceModel) -> None:
     if (
         instance.status == InstanceStatus.BUSY
-        and instance.job is not None
-        and instance.job.status.is_finished()
+        and instance.jobs
+        and all(job.status.is_finished() for job in instance.jobs)
     ):
         # A busy instance could have no active jobs due to this bug: https://github.com/dstackai/dstack/issues/2068
         instance.status = InstanceStatus.TERMINATING
@@ -648,9 +692,7 @@ async def _check_instance(instance: InstanceModel) -> None:
         instance.unreachable = False
 
         if instance.status == InstanceStatus.PROVISIONING:
-            instance.status = (
-                InstanceStatus.IDLE if instance.job_id is None else InstanceStatus.BUSY
-            )
+            instance.status = InstanceStatus.IDLE if not instance.jobs else InstanceStatus.BUSY
             logger.info(
                 "Instance %s has switched to %s status",
                 instance.name,

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 from uuid import UUID
 
+import gpuhunt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dstack._internal.core.models.backends.base import BackendType
@@ -13,14 +14,22 @@ from dstack._internal.core.models.configurations import (
     AnyRunConfiguration,
     DevEnvironmentConfiguration,
 )
+from dstack._internal.core.models.envs import Env
 from dstack._internal.core.models.fleets import FleetConfiguration, FleetSpec, FleetStatus
 from dstack._internal.core.models.gateways import GatewayStatus
 from dstack._internal.core.models.instances import (
+    Disk,
+    Gpu,
+    InstanceAvailability,
     InstanceConfiguration,
+    InstanceOfferWithAvailability,
+    InstanceSharedInfo,
+    InstanceSharedOffer,
     InstanceStatus,
     InstanceType,
     RemoteConnectionInfo,
     Resources,
+    SSHKey,
 )
 from dstack._internal.core.models.placement import (
     PlacementGroupConfiguration,
@@ -311,17 +320,30 @@ async def create_job(
     return job
 
 
-def get_job_provisioning_data(dockerized: bool = False) -> JobProvisioningData:
+def get_job_provisioning_data(
+    dockerized: bool = False,
+    backend: BackendType = BackendType.AWS,
+    region: str = "us-east-1",
+    gpu_count: int = 0,
+    cpu_count: int = 1,
+    memory_gib: float = 0.5,
+    spot: bool = False,
+    hostname: str = "127.0.0.4",
+    internal_ip: Optional[str] = "127.0.0.4",
+) -> JobProvisioningData:
+    gpus = [Gpu(name="T4", memory_mib=16384, vendor=gpuhunt.AcceleratorVendor.NVIDIA)] * gpu_count
     return JobProvisioningData(
-        backend=BackendType.AWS,
+        backend=backend,
         instance_type=InstanceType(
             name="instance",
-            resources=Resources(cpus=1, memory_mib=512, spot=False, gpus=[]),
+            resources=Resources(
+                cpus=cpu_count, memory_mib=int(memory_gib * 1024), spot=spot, gpus=gpus
+            ),
         ),
         instance_id="instance_id",
-        hostname="127.0.0.4",
-        internal_ip="127.0.0.4",
-        region="us-east-1",
+        hostname=hostname,
+        internal_ip=internal_ip,
+        region=region,
         price=10.5,
         username="ubuntu",
         ssh_port=22,
@@ -337,6 +359,8 @@ def get_job_runtime_data(
     gpu: Optional[int] = None,
     memory: Optional[float] = None,
     ports: Optional[dict[int, int]] = None,
+    offer: Optional[InstanceSharedOffer] = None,
+    volume_names: Optional[list[str]] = None,
 ) -> JobRuntimeData:
     return JobRuntimeData(
         network_mode=NetworkMode(network_mode),
@@ -344,6 +368,8 @@ def get_job_runtime_data(
         gpu=gpu,
         memory=Memory(memory) if memory is not None else None,
         ports=ports,
+        offer=offer,
+        volume_names=volume_names,
     )
 
 
@@ -481,56 +507,25 @@ async def create_instance(
     termination_idle_time: int = DEFAULT_POOL_TERMINATION_IDLE_TIME,
     region: str = "eu-west",
     remote_connection_info: Optional[RemoteConnectionInfo] = None,
+    offer: Optional[InstanceOfferWithAvailability] = None,
     job_provisioning_data: Optional[JobProvisioningData] = None,
+    shared_info: Optional[InstanceSharedInfo] = None,
     name: str = "test_instance",
     volumes: Optional[List[VolumeModel]] = None,
 ) -> InstanceModel:
     if instance_id is None:
         instance_id = uuid.uuid4()
     if job_provisioning_data is None:
-        job_provisioning_data_dict = {
-            "backend": backend.value,
-            "instance_type": {
-                "name": "instance",
-                "resources": {
-                    "cpus": 1,
-                    "memory_mib": 512,
-                    "gpus": [],
-                    "spot": spot,
-                    "disk": {"size_mib": 102400},
-                    "description": "",
-                },
-            },
-            "instance_id": "running_instance.id",
-            "ssh_proxy": None,
-            "hostname": "running_instance.ip",
-            "region": region,
-            "price": 0.1,
-            "username": "root",
-            "ssh_port": 22,
-            "dockerized": True,
-            "backend_data": None,
-        }
-    else:
-        job_provisioning_data_dict = job_provisioning_data.dict()
-    offer = {
-        "backend": backend.value,
-        "instance": {
-            "name": "instance",
-            "resources": {
-                "cpus": 2,
-                "memory_mib": 12000,
-                "gpus": [],
-                "spot": spot,
-                "disk": {"size_mib": 102400},
-                "description": "",
-            },
-        },
-        "region": region,
-        "price": 1,
-        "availability": "available",
-    }
-
+        job_provisioning_data = get_job_provisioning_data(
+            dockerized=True,
+            backend=backend,
+            region=region,
+            spot=spot,
+            hostname="running_instance.ip",
+            internal_ip=None,
+        )
+    if offer is None:
+        offer = get_instance_offer_with_availability(backend=backend, region=region, spot=spot)
     if profile is None:
         profile = Profile(name="test_name")
 
@@ -561,8 +556,8 @@ async def create_instance(
         created_at=created_at,
         started_at=created_at,
         finished_at=finished_at,
-        job_provisioning_data=json.dumps(job_provisioning_data_dict),
-        offer=json.dumps(offer),
+        job_provisioning_data=job_provisioning_data.json(),
+        offer=offer.json(),
         price=1,
         region=region,
         backend=backend,
@@ -572,12 +567,111 @@ async def create_instance(
         requirements=requirements.json(),
         instance_configuration=instance_configuration.json(),
         remote_connection_info=remote_connection_info.json() if remote_connection_info else None,
-        job=job,
         volumes=volumes,
+        shared_info=shared_info.json() if shared_info else None,
     )
+    if job:
+        im.jobs.append(job)
     session.add(im)
     await session.commit()
     return im
+
+
+def get_instance_offer_with_availability(
+    backend: BackendType = BackendType.AWS,
+    region: str = "eu-west",
+    gpu_count: int = 0,
+    cpu_count: int = 2,
+    memory_gib: float = 12,
+    disk_gib: float = 100.0,
+    spot: bool = False,
+):
+    gpus = [Gpu(name="T4", memory_mib=16384, vendor=gpuhunt.AcceleratorVendor.NVIDIA)] * gpu_count
+    return InstanceOfferWithAvailability(
+        backend=backend,
+        instance=InstanceType(
+            name="instance",
+            resources=Resources(
+                cpus=cpu_count,
+                memory_mib=int(memory_gib * 1024),
+                gpus=gpus,
+                spot=spot,
+                disk=Disk(size_mib=int(disk_gib * 1024)),
+                description="",
+            ),
+        ),
+        region=region,
+        price=1,
+        availability=InstanceAvailability.AVAILABLE,
+    )
+
+
+def get_instance_shared_offer(
+    blocks: int,
+    total_blocks: int,
+    backend: BackendType = BackendType.AWS,
+    region: str = "eu-west",
+    gpu_count: int = 0,
+    cpu_count: int = 2,
+    memory_gib: float = 12,
+    disk_gib: float = 100.0,
+    spot: bool = False,
+):
+    gpus = [Gpu(name="T4", memory_mib=16384, vendor=gpuhunt.AcceleratorVendor.NVIDIA)] * gpu_count
+    return InstanceSharedOffer(
+        backend=backend,
+        instance=InstanceType(
+            name="instance",
+            resources=Resources(
+                cpus=cpu_count,
+                memory_mib=int(memory_gib * 1024),
+                gpus=gpus,
+                spot=spot,
+                disk=Disk(size_mib=int(disk_gib * 1024)),
+                description="",
+            ),
+        ),
+        region=region,
+        price=1,
+        availability=InstanceAvailability.AVAILABLE,
+        blocks=blocks,
+        total_blocks=total_blocks,
+    )
+
+
+def get_remote_connection_info(
+    host: str = "10.0.0.10",
+    port: int = 22,
+    ssh_user: str = "ubuntu",
+    ssh_keys: Optional[list[SSHKey]] = None,
+    env: Optional[Union[Env, dict]] = None,
+):
+    if ssh_keys is None:
+        ssh_keys = [
+            SSHKey(
+                public="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO6mJxVbNtm0zXgMLvByrhXJCmJRveSrJxLB5/OzcyCk",
+                private="""
+                    -----BEGIN OPENSSH PRIVATE KEY-----
+                    b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+                    QyNTUxOQAAACDupicVWzbZtM14DC7wcq4VyQpiUb3kqycSwefzs3MgpAAAAJCiWa5Volmu
+                    VQAAAAtzc2gtZWQyNTUxOQAAACDupicVWzbZtM14DC7wcq4VyQpiUb3kqycSwefzs3MgpA
+                    AAAEAncHi4AhS6XdMp5Gzd+IMse/4ekyQ54UngByf0Sp0uH+6mJxVbNtm0zXgMLvByrhXJ
+                    CmJRveSrJxLB5/OzcyCkAAAACWRlZkBkZWZwYwECAwQ=
+                    -----END OPENSSH PRIVATE KEY-----
+                """,
+            )
+        ]
+    if env is None:
+        env = Env()
+    elif isinstance(env, dict):
+        env = Env.parse_obj(env)
+    return RemoteConnectionInfo(
+        host=host,
+        port=port,
+        ssh_user=ssh_user,
+        ssh_keys=ssh_keys,
+        env=env,
+    )
 
 
 async def create_volume(

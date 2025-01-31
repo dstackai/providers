@@ -38,9 +38,13 @@ from dstack._internal.server.services.jobs.configurators.dev import DevEnvironme
 from dstack._internal.server.services.jobs.configurators.service import ServiceJobConfigurator
 from dstack._internal.server.services.jobs.configurators.task import TaskJobConfigurator
 from dstack._internal.server.services.logging import fmt
+from dstack._internal.server.services.pools import get_instance_shared_info
 from dstack._internal.server.services.runner import client
 from dstack._internal.server.services.runner.ssh import runner_ssh_tunnel
-from dstack._internal.server.services.volumes import volume_model_to_volume
+from dstack._internal.server.services.volumes import (
+    list_project_volume_models,
+    volume_model_to_volume,
+)
 from dstack._internal.utils import common
 from dstack._internal.utils.common import get_or_error, run_async
 from dstack._internal.utils.logging import get_logger
@@ -161,7 +165,7 @@ async def stop_runner(session: AsyncSession, job_model: JobModel):
     res = await session.execute(
         select(InstanceModel).where(
             InstanceModel.project_id == job_model.project_id,
-            InstanceModel.job_id == job_model.id,
+            InstanceModel.id == job_model.instance_id,
         )
     )
     instance: Optional[InstanceModel] = res.scalar()
@@ -219,6 +223,8 @@ async def process_terminating_job(
         _set_job_termination_status(job_model)
         return
 
+    all_volumes_detached: bool = True
+    jrd = get_job_runtime_data(job_model)
     jpd = get_job_provisioning_data(job_model)
     if jpd is not None:
         logger.debug("%s: stopping container", fmt(job_model))
@@ -232,17 +238,32 @@ async def process_terminating_job(
             )
             ssh_private_key = remote_conn_info.ssh_keys[0].private
         await stop_container(job_model, jpd, ssh_private_key)
-        if len(instance_model.volumes) > 0:
-            logger.info("Detaching volumes: %s", [v.name for v in instance_model.volumes])
-            await _detach_volumes_from_job_instance(
+        volume_models: list[VolumeModel]
+        if jrd is not None and jrd.volume_names is not None:
+            volume_models = await list_project_volume_models(
+                session=session, project=instance_model.project, names=jrd.volume_names
+            )
+        else:
+            volume_models = instance_model.volumes
+        if len(volume_models) > 0:
+            logger.info("Detaching volumes: %s", [v.name for v in volume_models])
+            all_volumes_detached = await _detach_volumes_from_job_instance(
                 project=instance_model.project,
                 job_model=job_model,
                 jpd=jpd,
                 instance_model=instance_model,
+                volume_models=volume_models,
             )
 
     if instance_model.status == InstanceStatus.BUSY:
-        instance_model.status = InstanceStatus.IDLE
+        # no other jobs besides this one
+        if not [j for j in instance_model.jobs if j.id != job_model.id]:
+            instance_model.status = InstanceStatus.IDLE
+        if jrd is not None and jrd.offer is not None:
+            shared_info = get_instance_shared_info(instance_model)
+            if shared_info is not None:
+                shared_info.busy_blocks -= jrd.offer.blocks
+                instance_model.shared_info = shared_info.json()
     elif instance_model.status != InstanceStatus.TERMINATED:
         # instance was PROVISIONING (specially for the job)
         # schedule for termination
@@ -254,7 +275,7 @@ async def process_terminating_job(
 
     # The instance should be released even if detach fails
     # so that stuck volumes don't prevent the instance from terminating.
-    instance_model.job_id = None
+    job_model.instance_id = None
     instance_model.last_job_processed_at = common.get_current_datetime()
     logger.info(
         "%s: instance '%s' has been released, new status is %s",
@@ -263,9 +284,8 @@ async def process_terminating_job(
         instance_model.status.name,
     )
     await services.unregister_replica(session, job_model)
-    if len(instance_model.volumes) == 0:
+    if all_volumes_detached:
         # Do not terminate while some volumes are not detached.
-        # TODO: In case of multiple jobs per instance, don't consider volumes from other jobs.
         _set_job_termination_status(job_model)
 
 
@@ -280,18 +300,25 @@ async def process_volumes_detaching(
     If the volumes fail to detach, force detaches them.
     """
     jpd = get_or_error(get_job_provisioning_data(job_model))
-    logger.info("Detaching volumes: %s", [v.name for v in instance_model.volumes])
-    await _detach_volumes_from_job_instance(
+    jrd = get_job_runtime_data(job_model)
+    if jrd is not None and jrd.volume_names is not None:
+        volume_models = await list_project_volume_models(
+            session=session, project=instance_model.project, names=jrd.volume_names
+        )
+    else:
+        volume_models = instance_model.volumes
+    logger.info("Detaching volumes: %s", [v.name for v in volume_models])
+    all_volumes_detached = await _detach_volumes_from_job_instance(
         project=instance_model.project,
         job_model=job_model,
         jpd=jpd,
         instance_model=instance_model,
+        volume_models=volume_models,
     )
-    if len(instance_model.volumes) == 0:
+    if all_volumes_detached:
         # Do not terminate the job while some volumes are not detached.
         # If force detach never succeeds, the job will be stuck terminating.
         # The job releases the instance when soft detaching, so the instance won't be stuck.
-        # TODO: In case of multiple jobs per instance, don't consider volumes from other jobs.
         _set_job_termination_status(job_model)
 
 
@@ -378,7 +405,8 @@ async def _detach_volumes_from_job_instance(
     job_model: JobModel,
     jpd: JobProvisioningData,
     instance_model: InstanceModel,
-):
+    volume_models: list[VolumeModel],
+) -> bool:
     job_spec = JobSpec.__response__.parse_raw(job_model.job_spec_data)
     backend = await backends_services.get_project_backend_by_type(
         project=project,
@@ -388,11 +416,11 @@ async def _detach_volumes_from_job_instance(
         logger.error(
             "Failed to detach volumes from %s. Backend not available.", instance_model.name
         )
-        return
+        return False
 
-    # TODO: In case of multiple jobs per instance, detach only volumes used by this job
+    all_detached = True
     detached_volumes = []
-    for volume_model in instance_model.volumes:
+    for volume_model in volume_models:
         detached = await _detach_volume_from_job_instance(
             backend=backend,
             job_model=job_model,
@@ -403,6 +431,8 @@ async def _detach_volumes_from_job_instance(
         )
         if detached:
             detached_volumes.append(volume_model)
+        else:
+            all_detached = False
 
     if job_model.volumes_detached_at is None:
         job_model.volumes_detached_at = common.get_current_datetime()
@@ -410,6 +440,7 @@ async def _detach_volumes_from_job_instance(
     instance_model.volumes = [
         v for v in instance_model.volumes if v.id not in detached_volumes_ids
     ]
+    return all_detached
 
 
 async def _detach_volume_from_job_instance(

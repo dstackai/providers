@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional
+from typing import List, Literal, Optional, Union
 
 import gpuhunt
 from pydantic import root_validator
@@ -110,6 +110,11 @@ class InstanceConfiguration(CoreModel):
         return [ssh_key.public.strip() for ssh_key in self.ssh_keys]
 
 
+class InstanceSharedInfo(CoreModel):
+    total_blocks: Union[Literal["auto"], int]
+    busy_blocks: int = 0
+
+
 class InstanceRuntime(Enum):
     SHIM = "shim"
     RUNNER = "runner"
@@ -141,6 +146,11 @@ class InstanceOffer(CoreModel):
 class InstanceOfferWithAvailability(InstanceOffer):
     availability: InstanceAvailability
     instance_runtime: InstanceRuntime = InstanceRuntime.SHIM
+
+
+class InstanceSharedOffer(InstanceOfferWithAvailability):
+    blocks: int
+    total_blocks: int
 
 
 class InstanceStatus(str, Enum):

@@ -1,4 +1,6 @@
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple, Union
+
+import gpuhunt
 
 from dstack._internal.core.backends import (
     BACKENDS_WITH_CREATE_INSTANCE_SUPPORT,
@@ -7,7 +9,12 @@ from dstack._internal.core.backends import (
 )
 from dstack._internal.core.backends.base import Backend
 from dstack._internal.core.models.backends.base import BackendType
-from dstack._internal.core.models.instances import InstanceOfferWithAvailability
+from dstack._internal.core.models.instances import (
+    InstanceOfferWithAvailability,
+    InstanceSharedOffer,
+    InstanceType,
+    Resources,
+)
 from dstack._internal.core.models.profiles import Profile
 from dstack._internal.core.models.runs import JobProvisioningData, Requirements
 from dstack._internal.core.models.volumes import Volume
@@ -25,6 +32,7 @@ async def get_offers_by_requirements(
     volumes: Optional[List[List[Volume]]] = None,
     privileged: bool = False,
     instance_mounts: bool = False,
+    blocks: Optional[Union[Literal["auto"], int]] = None,
 ) -> List[Tuple[Backend, InstanceOfferWithAvailability]]:
     backends: List[Backend] = await backends_services.get_project_backends(project=project)
 
@@ -92,4 +100,48 @@ async def get_offers_by_requirements(
     if profile.instance_types is not None:
         offers = [(b, o) for b, o in offers if o.instance.name in profile.instance_types]
 
-    return offers
+    if blocks is None or blocks == 1:
+        return offers
+
+    shareable_offers = []
+    for backend, offer in offers:
+        resources = offer.instance.resources
+        gpus = resources.gpus
+        if not gpus:
+            continue
+        if gpus[0].vendor == gpuhunt.AcceleratorVendor.GOOGLE:
+            # TPU instances cannot be shared
+            continue
+        if blocks == "auto":
+            divisor = len(gpus)
+        else:
+            divisor = blocks
+        if len(gpus) % divisor or resources.cpus % divisor:
+            # gpus or cpus are not divisible by blocks
+            continue
+        shareable_offers.append((backend, offer))
+    return shareable_offers
+
+
+def generate_shared_offer(offer: InstanceOfferWithAvailability, blocks: int, total_blocks: int):
+    full_resources = offer.instance.resources
+    resources = Resources(
+        cpus=full_resources.cpus // total_blocks * blocks,
+        memory_mib=full_resources.memory_mib // total_blocks * blocks,
+        gpus=full_resources.gpus[: len(full_resources.gpus) // total_blocks * blocks],
+        spot=full_resources.spot,
+        disk=full_resources.disk,
+        description=full_resources.description,
+    )
+    return InstanceSharedOffer(
+        backend=offer.backend,
+        instance=InstanceType(
+            name=offer.instance.name,
+            resources=resources,
+        ),
+        region=offer.region,
+        price=offer.price,
+        availability=offer.availability,
+        blocks=blocks,
+        total_blocks=total_blocks,
+    )

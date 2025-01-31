@@ -2,7 +2,7 @@ import itertools
 import math
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import pydantic
 from sqlalchemy import and_, func, or_, select, update
@@ -19,6 +19,7 @@ from dstack._internal.core.models.common import ApplyAction, is_core_model_insta
 from dstack._internal.core.models.instances import (
     InstanceAvailability,
     InstanceOfferWithAvailability,
+    InstanceSharedOffer,
     InstanceStatus,
 )
 from dstack._internal.core.models.profiles import (
@@ -80,6 +81,7 @@ from dstack._internal.server.services.pools import (
     get_instance_offer,
     get_or_create_pool_by_name,
     get_pool_instances,
+    get_shared_pool_instances_with_offers,
 )
 from dstack._internal.server.services.projects import list_project_models, list_user_project_models
 from dstack._internal.server.services.users import get_user_model_by_name
@@ -677,27 +679,40 @@ async def _get_pool_offers(
     run_spec: RunSpec,
     job: Job,
     volumes: List[List[Volume]],
-) -> List[InstanceOfferWithAvailability]:
+) -> list[Union[InstanceSharedOffer, InstanceOfferWithAvailability]]:
+    pool_offers: list[Union[InstanceSharedOffer, InstanceOfferWithAvailability]] = []
+
     detaching_instances_ids = await get_instances_ids_with_detaching_volumes(session)
     pool_instances = [i for i in get_pool_instances(pool) if i.id not in detaching_instances_ids]
-    pool_filtered_instances = filter_pool_instances(
+    multinode = job.job_spec.jobs_per_replica > 1
+
+    if not multinode:
+        shared_instances_with_offers = get_shared_pool_instances_with_offers(
+            pool_instances=pool_instances,
+            profile=run_spec.merged_profile,
+            requirements=job.job_spec.requirements,
+            volumes=volumes,
+        )
+        for _, offer in shared_instances_with_offers:
+            pool_offers.append(offer)
+
+    nonshared_instances = filter_pool_instances(
         pool_instances=pool_instances,
         profile=run_spec.merged_profile,
         requirements=job.job_spec.requirements,
-        multinode=job.job_spec.jobs_per_replica > 1,
+        multinode=multinode,
         volumes=volumes,
+        shared=False,
     )
-    pool_offers: List[InstanceOfferWithAvailability] = []
-    for instance in pool_filtered_instances:
+    for instance in nonshared_instances:
         offer = get_instance_offer(instance)
         if offer is None:
             continue
         offer.availability = InstanceAvailability.BUSY
         if instance.status == InstanceStatus.IDLE:
             offer.availability = InstanceAvailability.IDLE
-        if instance.unreachable:
-            offer.availability = InstanceAvailability.NOT_AVAILABLE
         pool_offers.append(offer)
+
     pool_offers.sort(key=lambda offer: offer.price)
     return pool_offers
 
