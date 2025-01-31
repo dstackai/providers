@@ -2,9 +2,9 @@ type: dev-environment
 # The name is optional, if not specified, generated randomly
 name: vscode
 
-python: "3.11"
+#python: "3.11"
 # Uncomment to use a custom Docker image
-#image: dstackai/base:py3.13-0.6-cuda-12.1
+image: dstackai/base:py3.13-0.6-cuda-12.1
 
 ide: vscode
 

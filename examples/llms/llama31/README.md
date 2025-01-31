@@ -181,7 +181,7 @@ Provisioning...
 </div>
 
 Once the service is up, the model will be available via the OpenAI-compatible endpoint
-at `<dstack server URL>/proxy/models/<project name>/.
+at `<dstack server URL>/proxy/models/<project name>/`.
 
 <div class="termy">
 

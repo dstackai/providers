@@ -1,0 +1,17 @@
+type: service
+name: deepseek-r1-nvidia
+
+image: vllm/vllm-openai:latest
+env:
+  - MODEL_ID=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  - MAX_MODEL_LEN=4096
+commands:
+  - vllm serve $MODEL_ID
+    --max-model-len $MAX_MODEL_LEN
+
+port: 8000
+
+model: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+
+resources:
+    gpu: 24GB

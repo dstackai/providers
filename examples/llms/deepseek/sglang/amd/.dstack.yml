@@ -1,0 +1,18 @@
+type: service
+name: deepseek-r1-amd
+
+image: lmsysorg/sglang:v0.4.1.post4-rocm620
+env:
+  - MODEL_ID=deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+commands:
+  - python3 -m sglang.launch_server
+    --model-path $MODEL_ID
+    --port 8000
+    --trust-remote-code
+
+port: 8000
+model: deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+
+resources:
+    gpu: mi300x
+    disk: 300Gb

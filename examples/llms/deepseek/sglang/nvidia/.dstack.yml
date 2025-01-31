@@ -1,0 +1,18 @@
+type: service
+name: deepseek-r1-nvidia
+
+image: lmsysorg/sglang:latest
+env:
+  - MODEL_ID=deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+commands:
+  - python3 -m sglang.launch_server
+    --model-path $MODEL_ID
+    --port 8000
+    --trust-remote-code
+
+port: 8000
+
+model: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+
+resources:
+    gpu: 24GB
