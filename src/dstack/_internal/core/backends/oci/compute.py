@@ -163,7 +163,7 @@ class OCICompute(Compute):
                 image_id=package.image_id,
             )
         except oci.exceptions.ServiceError as e:
-            if e.code in ("LimitExceeded", "QuotaExceeded"):
+            if e.code in ("LimitExceeded", "QuotaExceeded") or "Out of host capacity" in e.message:
                 raise NoCapacityError(e.message)
             raise
 

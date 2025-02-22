@@ -95,3 +95,18 @@ Some providers offer extreme flexibility in possible configurations, but not all
 The offline catalog is built in GitHub Actions every night. Every offline provider produces a CSV file with offers. Later, those files get compressed into a zip archive and uploaded to the public S3 bucket.
 
 To ensure data quality, there is a catalog integrity testing step. It uses some simple heuristics to avoid empty catalog files, zero prices, or missing regions.
+
+### Backward compatibility
+
+The same `gpuhunt` version can be used by different `dstack` versions.
+Additionally, offline catalogs are produced by the latest `gpuhunt` version, but used by all `dstack` versions.
+
+These mechanisms are used to preserve backward compatibility:
+
+- **`gpuhunt` version**: The interfaces in the `gpuhunt` package preserve backward compatibility
+  within a minor version (`X` in `0.X.Y`).
+- **Offer flags**: If an offer breaks older `dstack` versions, it is marked with a flag in `RawCatalogItem.flags`
+  and the flag is added to the list of supported flags in `dstack`.
+  Older `dstack` versions that don't support this flag will not see the respective offers.
+- **Offline catalog versions**: If a breaking change in the structure or content of an offline catalog is unavoidable,
+  a new version of the catalog can be introduced. Catalog versions are published at `s3://dstack-gpu-pricing/v{N}`.

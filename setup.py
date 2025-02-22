@@ -48,7 +48,7 @@ BASE_DEPS = [
     "python-multipart>=0.0.16",
     "filelock",
     "psutil",
-    "gpuhunt>=0.0.19,<0.1.0",
+    "gpuhunt>=0.1.0,<0.2.0",
     "argcomplete>=3.5.0",
 ]
 

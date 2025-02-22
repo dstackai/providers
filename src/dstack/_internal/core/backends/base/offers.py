@@ -14,6 +14,12 @@ from dstack._internal.core.models.instances import (
 from dstack._internal.core.models.resources import DEFAULT_DISK, Memory, Range
 from dstack._internal.core.models.runs import Requirements
 
+# Offers not supported by all dstack versions are hidden behind one or more flags.
+# This list enables the flags that are currently supported.
+SUPPORTED_GPUHUNT_FLAGS = [
+    "oci-spot",
+]
+
 
 def get_catalog_offers(
     backend: BackendType,
@@ -110,7 +116,7 @@ def offer_to_catalog_item(offer: InstanceOffer) -> gpuhunt.CatalogItem:
 
 
 def requirements_to_query_filter(req: Optional[Requirements]) -> gpuhunt.QueryFilter:
-    q = gpuhunt.QueryFilter()
+    q = gpuhunt.QueryFilter(allowed_flags=SUPPORTED_GPUHUNT_FLAGS)
     if req is None:
         return q
 
